@@ -1,0 +1,9 @@
+# Actual hosts configuration (keep example only)
+hosts.conf
+
+# Backup files
+*.bak
+*~
+
+# Log files
+*.log

@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+
+#==============================================================================
+# sendspin-fleet - Fleet management tool for sendspin installations
+#==============================================================================
+# A simple fleet management script to check status and update sendspin-cli
+# across multiple Linux hosts via SSH.
+#==============================================================================
+
+set -o errexit   # Exit on error
+set -o nounset   # Exit on undefined variable
+set -o pipefail  # Exit on pipe failure
+
+#==============================================================================
+# Configuration
+#==============================================================================
+
+# Default service user name (can be overridden via environment variable)
+SENDSPIN_USER="${SENDSPIN_USER:-sendspin}"
+
+# Default hosts configuration file
+HOSTS_FILE="${HOSTS_FILE:-hosts.conf}"
+
+#==============================================================================
+# Output Helper Functions
+#==============================================================================
+
+# Color codes for terminal output
+readonly COLOR_RESET="\033[0m"
+readonly COLOR_HEADER="\033[1;96m"
+readonly COLOR_SUBHEADER="\033[1;93m"
+readonly COLOR_SUCCESS="\033[92m"
+readonly COLOR_ERROR="\033[91m"
+readonly COLOR_INFO="\033[36m"
+readonly COLOR_WARNING="\033[33m"
+
+# Print a header message
+print_header() {
+    echo -e "${COLOR_HEADER}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${COLOR_RESET}" >&2
+    echo -e "${COLOR_HEADER}  $1${COLOR_RESET}" >&2
+    echo -e "${COLOR_HEADER}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${COLOR_RESET}" >&2
+}
+
+# Print a subheader message
+print_subheader() {
+    echo -e "${COLOR_SUBHEADER}▶ $1${COLOR_RESET}" >&2
+}
+
+# Print a success message
+print_success() {
+    echo -e "${COLOR_SUCCESS}✔ $1${COLOR_RESET}" >&2
+}
+
+# Print an error message
+print_error() {
+    echo -e "${COLOR_ERROR}✘ $1${COLOR_RESET}" >&2
+}
+
+# Print an info message
+print_info() {
+    echo -e "${COLOR_INFO}ℹ $1${COLOR_RESET}" >&2
+}
+
+# Print a warning message
+print_warning() {
+    echo -e "${COLOR_WARNING}⚠ $1${COLOR_RESET}" >&2
+}
+
+# Display usage information
+show_usage() {
+    print_header "sendspin-fleet - Fleet Management Tool"
+    echo
+    echo "Usage: $(basename "$0") <command>"
+    echo
+    print_subheader "Commands:"
+    echo "  status          Check status, version, and name of all hosts"
+    echo "  update-system   Update system packages (apt update && upgrade)"
+    echo "  update-sendspin Update sendspin-cli package via uv"
+    echo "  update-all      Update both system packages and sendspin-cli"
+    echo "  help            Show this help message"
+    echo
+    print_subheader "Configuration:"
+    echo "  Hosts file:     ${HOSTS_FILE}"
+    echo "  Service user:   ${SENDSPIN_USER}"
+    echo
+    print_subheader "Environment Variables:"
+    echo "  HOSTS_FILE      Path to hosts configuration file (default: hosts.conf)"
+    echo "  SENDSPIN_USER   Service user name (default: sendspin)"
+    echo
+}
+
+# Read and parse the hosts configuration file
+# Returns hosts as array of "hostname:user" pairs
+read_hosts() {
+    local hosts_file="$1"
+    local -a hosts=()
+    
+    if [[ ! -f "${hosts_file}" ]]; then
+        print_error "Hosts file not found: ${hosts_file}"
+        print_info "Create ${hosts_file} with format: hostname:ssh_user (one per line)"
+        exit 1
+    fi
+    
+    while IFS= read -r line; do
+        # Skip empty lines and comments
+        [[ -z "${line}" || "${line}" =~ ^[[:space:]]*# ]] && continue
+        
+        # Trim whitespace and add to array
+        line=$(echo "${line}" | xargs)
+        hosts+=("${line}")
+    done < "${hosts_file}"
+    
+    if [[ ${#hosts[@]} -eq 0 ]]; then
+        print_error "No hosts defined in ${hosts_file}"
+        exit 1
+    fi
+    
+    printf '%s\n' "${hosts[@]}"
+}
+
+# Parse a host entry into hostname and user
+parse_host() {
+    local host_entry="$1"
+    local hostname="${host_entry%%:*}"
+    local ssh_user="${host_entry##*:}"
+    
+    # If no colon, default to root
+    if [[ "${hostname}" == "${ssh_user}" ]]; then
+        ssh_user="root"
+    fi
+    
+    echo "${hostname} ${ssh_user}"
+}
+
+# Execute SSH command on a remote host
+ssh_exec() {
+    local hostname="$1"
+    local ssh_user="$2"
+    local command="$3"
+    
+    ssh -o ConnectTimeout=10 \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR \
+        "${ssh_user}@${hostname}" \
+        "${command}" 2>&1
+}
+
+#==============================================================================
+# Command Implementations
+#==============================================================================
+
+# Get status of all hosts
+cmd_status() {
+    print_header "Fleet Status Report"
+    echo
+    
+    local -a hosts
+    mapfile -t hosts < <(read_hosts "${HOSTS_FILE}")
+    
+    for host_entry in "${hosts[@]}"; do
+        read -r hostname ssh_user <<< "$(parse_host "${host_entry}")"
+        
+        print_subheader "Host: ${hostname} (${ssh_user})"
+        
+        # Check SSH connectivity
+        if ! ssh_exec "${hostname}" "${ssh_user}" "echo connected" &>/dev/null; then
+            print_error "Unable to connect via SSH"
+            echo
+            continue
+        fi
+        
+        print_success "SSH connection successful"
+        
+        # Get service status
+        echo -n "  Service status: "
+        local service_status
+        service_status=$(ssh_exec "${hostname}" "${ssh_user}" \
+            "systemctl is-active sendspin 2>/dev/null || echo 'not-found'")
+        
+        case "${service_status}" in
+            active)
+                echo -e "${COLOR_SUCCESS}✔ Running${COLOR_RESET}"
+                ;;
+            inactive|failed)
+                echo -e "${COLOR_ERROR}✘ Failed/Stopped${COLOR_RESET}"
+                ;;
+            *)
+                echo -e "${COLOR_WARNING}⚠ Unknown/Not Found${COLOR_RESET}"
+                ;;
+        esac
+        
+        # Get sendspin version
+        echo -n "  Sendspin version: "
+        local version
+        version=$(ssh_exec "${hostname}" "${ssh_user}" \
+            "sudo -u ${SENDSPIN_USER} /home/${SENDSPIN_USER}/.local/bin/sendspin --version 2>/dev/null || echo 'N/A'")
+        echo "${version}"
+        
+        # Get configured name from settings
+        echo -n "  Configured name: "
+        local config_name
+        config_name=$(ssh_exec "${hostname}" "${ssh_user}" \
+            "sudo -u ${SENDSPIN_USER} cat /home/${SENDSPIN_USER}/.config/sendspin/settings-daemon.json 2>/dev/null | grep -oP '\"name\"\\s*:\\s*\"\\K[^\"]+' || echo 'N/A'")
+        echo "${config_name}"
+        
+        echo
+    done
+    
+    print_success "Status report complete"
+}
+
+# Update system packages on all hosts
+cmd_update_system() {
+    print_header "Update System Packages"
+    echo
+    
+    local -a hosts
+    mapfile -t hosts < <(read_hosts "${HOSTS_FILE}")
+    
+    for host_entry in "${hosts[@]}"; do
+        read -r hostname ssh_user <<< "$(parse_host "${host_entry}")"
+        
+        print_subheader "Updating system on: ${hostname}"
+        
+        # Check SSH connectivity
+        if ! ssh_exec "${hostname}" "${ssh_user}" "echo connected" &>/dev/null; then
+            print_error "Unable to connect via SSH"
+            echo
+            continue
+        fi
+        
+        print_info "Running apt update && apt upgrade -y..."
+        
+        local update_output
+        if update_output=$(ssh_exec "${hostname}" "${ssh_user}" \
+            "sudo apt update && sudo apt upgrade -y" 2>&1); then
+            print_success "System packages updated successfully"
+        else
+            print_error "System update failed"
+            echo "${update_output}"
+        fi
+        
+        echo
+    done
+    
+    print_success "System updates complete"
+}
+
+# Update sendspin package on all hosts
+cmd_update_sendspin() {
+    print_header "Update Sendspin Package"
+    echo
+    
+    local -a hosts
+    mapfile -t hosts < <(read_hosts "${HOSTS_FILE}")
+    
+    for host_entry in "${hosts[@]}"; do
+        read -r hostname ssh_user <<< "$(parse_host "${host_entry}")"
+        
+        print_subheader "Updating sendspin on: ${hostname}"
+        
+        # Check SSH connectivity
+        if ! ssh_exec "${hostname}" "${ssh_user}" "echo connected" &>/dev/null; then
+            print_error "Unable to connect via SSH"
+            echo
+            continue
+        fi
+        
+        print_info "Running uv upgrade sendspin as ${SENDSPIN_USER}..."
+        
+        local update_output
+        if update_output=$(ssh_exec "${hostname}" "${ssh_user}" \
+            "sudo -u ${SENDSPIN_USER} /home/${SENDSPIN_USER}/.local/bin/uv tool upgrade sendspin" 2>&1); then
+            print_success "Sendspin package updated successfully"
+            echo "${update_output}"
+        else
+            print_error "Sendspin update failed"
+            echo "${update_output}"
+        fi
+        
+        # Restart service
+        print_info "Restarting sendspin service..."
+        if ssh_exec "${hostname}" "${ssh_user}" \
+            "sudo systemctl restart sendspin" &>/dev/null; then
+            print_success "Service restarted"
+        else
+            print_warning "Service restart may have failed"
+        fi
+        
+        echo
+    done
+    
+    print_success "Sendspin updates complete"
+}
+
+# Update both system packages and sendspin
+cmd_update_all() {
+    print_header "Update System and Sendspin"
+    echo
+    
+    print_info "This will update system packages AND sendspin on all hosts"
+    echo
+    
+    cmd_update_system
+    echo
+    cmd_update_sendspin
+}
+
+#==============================================================================
+# Main Script
+#==============================================================================
+
+main() {
+    # Check if a command was provided
+    if [[ $# -eq 0 ]]; then
+        show_usage
+        exit 1
+    fi
+    
+    local command="$1"
+    
+    # Execute the requested command
+    case "${command}" in
+        status)
+            cmd_status
+            ;;
+        update-system)
+            cmd_update_system
+            ;;
+        update-sendspin)
+            cmd_update_sendspin
+            ;;
+        update-all)
+            cmd_update_all
+            ;;
+        help|--help|-h)
+            show_usage
+            ;;
+        *)
+            print_error "Unknown command: ${command}"
+            echo
+            show_usage
+            exit 1
+            ;;
+    esac
+}
+
+# Run main function with all arguments
+main "$@"

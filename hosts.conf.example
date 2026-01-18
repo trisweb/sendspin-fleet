@@ -1,0 +1,11 @@
+# sendspin-fleet hosts configuration
+# Format: hostname:ssh_user
+# Lines starting with # are ignored
+# One host per line
+
+# Examples:
+# player1.local:root
+# player2.local:admin
+# 192.168.1.100:sendspin
+# audio-endpoint-01:myuser
+
