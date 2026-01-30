@@ -7,7 +7,6 @@
 # across multiple Linux hosts via SSH.
 #==============================================================================
 
-set -o errexit   # Exit on error
 set -o nounset   # Exit on undefined variable
 set -o pipefail  # Exit on pipe failure
 
@@ -66,6 +65,14 @@ print_warning() {
     echo -e "${COLOR_WARNING}⚠ $1${COLOR_RESET}" >&2
 }
 
+# Print with hostname prefix
+print_with_prefix() {
+    local hostname="$1"
+    local color="$2"
+    local message="$3"
+    echo -e "${color}[${hostname}]${COLOR_RESET} ${message}"
+}
+
 # Display usage information
 show_usage() {
     print_header "sendspin-fleet - Fleet Management Tool"
@@ -73,10 +80,10 @@ show_usage() {
     echo "Usage: $(basename "$0") <command>"
     echo
     print_subheader "Commands:"
-    echo "  status          Check status, version, and name of all hosts"
-    echo "  update-system   Update system packages (apt update && upgrade)"
-    echo "  update-sendspin Update sendspin-cli package via uv"
-    echo "  update-all      Update both system packages and sendspin-cli"
+    echo "  status          Check status, version, and name of all hosts (parallel)"
+    echo "  update-system   Update system packages (apt update && upgrade) (parallel)"
+    echo "  update-sendspin Update sendspin-cli package via uv (parallel)"
+    echo "  update-all      Update both system packages and sendspin-cli (parallel)"
     echo "  help            Show this help message"
     echo
     print_subheader "Configuration:"
@@ -86,6 +93,9 @@ show_usage() {
     print_subheader "Environment Variables:"
     echo "  HOSTS_FILE      Path to hosts configuration file (default: hosts.conf)"
     echo "  SENDSPIN_USER   Service user name (default: sendspin)"
+    echo
+    print_subheader "Performance:"
+    echo "  All operations run in parallel across hosts for maximum speed!"
     echo
 }
 
@@ -147,164 +157,221 @@ ssh_exec() {
 }
 
 #==============================================================================
+# Parallel Execution Framework
+#==============================================================================
+
+# Execute a function for a single host (meant to be run in background)
+execute_for_host() {
+    local host_entry="$1"
+    local operation="$2"
+    
+    read -r hostname ssh_user <<< "$(parse_host "${host_entry}")"
+    
+    # Call the specific operation function
+    case "${operation}" in
+        status)
+            check_status_single "${hostname}" "${ssh_user}"
+            ;;
+        update-system)
+            update_system_single "${hostname}" "${ssh_user}"
+            ;;
+        update-sendspin)
+            update_sendspin_single "${hostname}" "${ssh_user}"
+            ;;
+    esac
+}
+
+# Run operation in parallel across all hosts
+run_parallel() {
+    local operation="$1"
+    local -a hosts
+    local -a pids=()
+    
+    mapfile -t hosts < <(read_hosts "${HOSTS_FILE}")
+    
+    print_info "Running on ${#hosts[@]} host(s) in parallel..."
+    echo
+    
+    # Start all operations in parallel
+    for host_entry in "${hosts[@]}"; do
+        execute_for_host "${host_entry}" "${operation}" &
+        pids+=($!)
+    done
+    
+    # Wait for all background jobs to complete
+    local failed=0
+    for pid in "${pids[@]}"; do
+        if ! wait "${pid}"; then
+            ((failed++)) || true
+        fi
+    done
+    
+    echo
+    if [[ ${failed} -eq 0 ]]; then
+        print_success "All operations completed successfully"
+    else
+        print_warning "${failed} operation(s) had issues"
+    fi
+}
+
+#==============================================================================
+# Single Host Operation Functions (for parallel execution)
+#==============================================================================
+
+# Check status of a single host
+check_status_single() {
+    local hostname="$1"
+    local ssh_user="$2"
+    
+    # Check SSH connectivity
+    if ! ssh_exec "${hostname}" "${ssh_user}" "echo connected" &>/dev/null; then
+        print_with_prefix "${hostname}" "${COLOR_ERROR}" "✘ Unable to connect via SSH"
+        return 1
+    fi
+    
+    print_with_prefix "${hostname}" "${COLOR_SUCCESS}" "✔ SSH connected"
+    
+    # Get service status
+    local service_status
+    service_status=$(ssh_exec "${hostname}" "${ssh_user}" \
+        "systemctl is-active sendspin 2>/dev/null || echo 'not-found'")
+    
+    local status_msg
+    case "${service_status}" in
+        active)
+            status_msg="${COLOR_SUCCESS}✔ Service: Running${COLOR_RESET}"
+            ;;
+        inactive|failed)
+            status_msg="${COLOR_ERROR}✘ Service: Failed/Stopped${COLOR_RESET}"
+            ;;
+        *)
+            status_msg="${COLOR_WARNING}⚠ Service: Unknown/Not Found${COLOR_RESET}"
+            ;;
+    esac
+    print_with_prefix "${hostname}" "${COLOR_INFO}" "${status_msg}"
+    
+    # Get sendspin version
+    local version
+    version=$(ssh_exec "${hostname}" "${ssh_user}" \
+        "sudo -u ${SENDSPIN_USER} /home/${SENDSPIN_USER}/.local/bin/sendspin --version 2>/dev/null || echo 'N/A'")
+    print_with_prefix "${hostname}" "${COLOR_INFO}" "Version: ${version}"
+    
+    # Get configured name from settings
+    local config_name
+    config_name=$(ssh_exec "${hostname}" "${ssh_user}" \
+        "sudo -u ${SENDSPIN_USER} cat /home/${SENDSPIN_USER}/.config/sendspin/settings-daemon.json 2>/dev/null | grep -oP '\"name\"\\s*:\\s*\"\\K[^\"]+' || echo 'N/A'")
+    print_with_prefix "${hostname}" "${COLOR_INFO}" "Name: ${config_name}"
+    
+    return 0
+}
+
+# Update system packages on a single host
+update_system_single() {
+    local hostname="$1"
+    local ssh_user="$2"
+    
+    # Check SSH connectivity
+    if ! ssh_exec "${hostname}" "${ssh_user}" "echo connected" &>/dev/null; then
+        print_with_prefix "${hostname}" "${COLOR_ERROR}" "✘ Unable to connect via SSH"
+        return 1
+    fi
+    
+    print_with_prefix "${hostname}" "${COLOR_INFO}" "Starting apt update && upgrade..."
+    
+    local update_output
+    if update_output=$(ssh_exec "${hostname}" "${ssh_user}" \
+        "sudo DEBIAN_FRONTEND=noninteractive apt update -qq && sudo DEBIAN_FRONTEND=noninteractive apt upgrade -y -qq" 2>&1); then
+        print_with_prefix "${hostname}" "${COLOR_SUCCESS}" "✔ System packages updated"
+        return 0
+    else
+        print_with_prefix "${hostname}" "${COLOR_ERROR}" "✘ System update failed"
+        # Show error output with prefix
+        echo "${update_output}" | while IFS= read -r line; do
+            print_with_prefix "${hostname}" "${COLOR_ERROR}" "  ${line}"
+        done
+        return 1
+    fi
+}
+
+# Update sendspin package on a single host
+update_sendspin_single() {
+    local hostname="$1"
+    local ssh_user="$2"
+    
+    # Check SSH connectivity
+    if ! ssh_exec "${hostname}" "${ssh_user}" "echo connected" &>/dev/null; then
+        print_with_prefix "${hostname}" "${COLOR_ERROR}" "✘ Unable to connect via SSH"
+        return 1
+    fi
+    
+    print_with_prefix "${hostname}" "${COLOR_INFO}" "Upgrading sendspin via uv..."
+    
+    local update_output
+    if update_output=$(ssh_exec "${hostname}" "${ssh_user}" \
+        "sudo -u ${SENDSPIN_USER} /home/${SENDSPIN_USER}/.local/bin/uv tool upgrade sendspin" 2>&1); then
+        print_with_prefix "${hostname}" "${COLOR_SUCCESS}" "✔ Sendspin package upgraded"
+        
+        # Show upgrade output with prefix
+        echo "${update_output}" | while IFS= read -r line; do
+            [[ -n "${line}" ]] && print_with_prefix "${hostname}" "${COLOR_INFO}" "  ${line}"
+        done
+    else
+        print_with_prefix "${hostname}" "${COLOR_ERROR}" "✘ Sendspin upgrade failed"
+        echo "${update_output}" | while IFS= read -r line; do
+            print_with_prefix "${hostname}" "${COLOR_ERROR}" "  ${line}"
+        done
+        return 1
+    fi
+    
+    # Restart service
+    print_with_prefix "${hostname}" "${COLOR_INFO}" "Restarting sendspin service..."
+    if ssh_exec "${hostname}" "${ssh_user}" "sudo systemctl restart sendspin" &>/dev/null; then
+        print_with_prefix "${hostname}" "${COLOR_SUCCESS}" "✔ Service restarted"
+        return 0
+    else
+        print_with_prefix "${hostname}" "${COLOR_WARNING}" "⚠ Service restart may have failed"
+        return 1
+    fi
+}
+
+#==============================================================================
 # Command Implementations
 #==============================================================================
 
-# Get status of all hosts
+# Get status of all hosts (parallel)
 cmd_status() {
     print_header "Fleet Status Report"
     echo
-    
-    local -a hosts
-    mapfile -t hosts < <(read_hosts "${HOSTS_FILE}")
-    
-    for host_entry in "${hosts[@]}"; do
-        read -r hostname ssh_user <<< "$(parse_host "${host_entry}")"
-        
-        print_subheader "Host: ${hostname} (${ssh_user})"
-        
-        # Check SSH connectivity
-        if ! ssh_exec "${hostname}" "${ssh_user}" "echo connected" &>/dev/null; then
-            print_error "Unable to connect via SSH"
-            echo
-            continue
-        fi
-        
-        print_success "SSH connection successful"
-        
-        # Get service status
-        echo -n "  Service status: "
-        local service_status
-        service_status=$(ssh_exec "${hostname}" "${ssh_user}" \
-            "systemctl is-active sendspin 2>/dev/null || echo 'not-found'")
-        
-        case "${service_status}" in
-            active)
-                echo -e "${COLOR_SUCCESS}✔ Running${COLOR_RESET}"
-                ;;
-            inactive|failed)
-                echo -e "${COLOR_ERROR}✘ Failed/Stopped${COLOR_RESET}"
-                ;;
-            *)
-                echo -e "${COLOR_WARNING}⚠ Unknown/Not Found${COLOR_RESET}"
-                ;;
-        esac
-        
-        # Get sendspin version
-        echo -n "  Sendspin version: "
-        local version
-        version=$(ssh_exec "${hostname}" "${ssh_user}" \
-            "sudo -u ${SENDSPIN_USER} /home/${SENDSPIN_USER}/.local/bin/sendspin --version 2>/dev/null || echo 'N/A'")
-        echo "${version}"
-        
-        # Get configured name from settings
-        echo -n "  Configured name: "
-        local config_name
-        config_name=$(ssh_exec "${hostname}" "${ssh_user}" \
-            "sudo -u ${SENDSPIN_USER} cat /home/${SENDSPIN_USER}/.config/sendspin/settings-daemon.json 2>/dev/null | grep -oP '\"name\"\\s*:\\s*\"\\K[^\"]+' || echo 'N/A'")
-        echo "${config_name}"
-        
-        echo
-    done
-    
-    print_success "Status report complete"
+    run_parallel "status"
 }
 
-# Update system packages on all hosts
+# Update system packages on all hosts (parallel)
 cmd_update_system() {
     print_header "Update System Packages"
     echo
-    
-    local -a hosts
-    mapfile -t hosts < <(read_hosts "${HOSTS_FILE}")
-    
-    for host_entry in "${hosts[@]}"; do
-        read -r hostname ssh_user <<< "$(parse_host "${host_entry}")"
-        
-        print_subheader "Updating system on: ${hostname}"
-        
-        # Check SSH connectivity
-        if ! ssh_exec "${hostname}" "${ssh_user}" "echo connected" &>/dev/null; then
-            print_error "Unable to connect via SSH"
-            echo
-            continue
-        fi
-        
-        print_info "Running apt update && apt upgrade -y..."
-        
-        local update_output
-        if update_output=$(ssh_exec "${hostname}" "${ssh_user}" \
-            "sudo apt update && sudo apt upgrade -y" 2>&1); then
-            print_success "System packages updated successfully"
-        else
-            print_error "System update failed"
-            echo "${update_output}"
-        fi
-        
-        echo
-    done
-    
-    print_success "System updates complete"
+    run_parallel "update-system"
 }
 
-# Update sendspin package on all hosts
+# Update sendspin package on all hosts (parallel)
 cmd_update_sendspin() {
     print_header "Update Sendspin Package"
     echo
-    
-    local -a hosts
-    mapfile -t hosts < <(read_hosts "${HOSTS_FILE}")
-    
-    for host_entry in "${hosts[@]}"; do
-        read -r hostname ssh_user <<< "$(parse_host "${host_entry}")"
-        
-        print_subheader "Updating sendspin on: ${hostname}"
-        
-        # Check SSH connectivity
-        if ! ssh_exec "${hostname}" "${ssh_user}" "echo connected" &>/dev/null; then
-            print_error "Unable to connect via SSH"
-            echo
-            continue
-        fi
-        
-        print_info "Running uv upgrade sendspin as ${SENDSPIN_USER}..."
-        
-        local update_output
-        if update_output=$(ssh_exec "${hostname}" "${ssh_user}" \
-            "sudo -u ${SENDSPIN_USER} /home/${SENDSPIN_USER}/.local/bin/uv tool upgrade sendspin" 2>&1); then
-            print_success "Sendspin package updated successfully"
-            echo "${update_output}"
-        else
-            print_error "Sendspin update failed"
-            echo "${update_output}"
-        fi
-        
-        # Restart service
-        print_info "Restarting sendspin service..."
-        if ssh_exec "${hostname}" "${ssh_user}" \
-            "sudo systemctl restart sendspin" &>/dev/null; then
-            print_success "Service restarted"
-        else
-            print_warning "Service restart may have failed"
-        fi
-        
-        echo
-    done
-    
-    print_success "Sendspin updates complete"
+    run_parallel "update-sendspin"
 }
 
-# Update both system packages and sendspin
+# Update both system packages and sendspin (parallel, but sequential operations)
 cmd_update_all() {
     print_header "Update System and Sendspin"
     echo
     
-    print_info "This will update system packages AND sendspin on all hosts"
+    print_info "Updating system packages on all hosts in parallel..."
     echo
+    run_parallel "update-system"
     
-    cmd_update_system
     echo
-    cmd_update_sendspin
+    print_info "Updating sendspin on all hosts in parallel..."
+    echo
+    run_parallel "update-sendspin"
 }
 
 #==============================================================================
