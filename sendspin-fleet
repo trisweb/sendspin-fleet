@@ -171,16 +171,6 @@ ssh_exec() {
 # TUI Display Functions
 #==============================================================================
 
-# Global variable for TUI start row
-TUI_START_ROW=0
-
-# Get current cursor row position
-get_cursor_row() {
-    local row
-    IFS=';' read -sdR -p $'\E[6n' row col </dev/tty
-    echo "${row#*[}"
-}
-
 # Update status for a single host (writes to status file)
 update_host_status() {
     local hostname="$1"
@@ -191,29 +181,24 @@ update_host_status() {
     echo "${status}|${message}" > "${status_file}"
 }
 
-# Draw a single line at a specific row
-draw_line() {
-    local row="$1"
-    local content="$2"
-    # Move to row, column 1, clear line, print content
-    printf '\033[%d;1H\033[2K%b' "${row}" "${content}" >&2
-}
-
-# Draw the TUI display
+# Draw the TUI display with proper in-place updates
 draw_tui() {
     local -a hosts=("$@")
     local num_hosts=${#hosts[@]}
     
-    # Hide cursor
-    printf '%b' "${CURSOR_HIDE}" >&2
+    # Hide cursor using tput if available, fallback to ANSI
+    if command -v tput &>/dev/null; then
+        tput civis 2>/dev/null || printf '%b' "${CURSOR_HIDE}" >&2
+    else
+        printf '%b' "${CURSOR_HIDE}" >&2
+    fi
     
-    # Get current row position - this is where our TUI starts
-    TUI_START_ROW=$(get_cursor_row)
-    
-    # Reserve space for all host lines by printing placeholder lines
+    # Print initial placeholder lines to reserve space
     local i
     for ((i=0; i<num_hosts; i++)); do
-        echo "" >&2
+        local host_entry="${hosts[$i]}"
+        read -r hostname ssh_user <<< "$(parse_host "${host_entry}")"
+        printf '  %s: Waiting...\n' "${hostname}" >&2
     done
     
     # Monitor and update display
@@ -222,7 +207,13 @@ draw_tui() {
     
     while [[ "${all_done}" == false ]]; do
         all_done=true
-        local line_idx=0
+        
+        # Move cursor up to start of our display area
+        if command -v tput &>/dev/null; then
+            tput cuu "${num_hosts}" 2>/dev/null || printf '\033[%dA' "${num_hosts}" >&2
+        else
+            printf '\033[%dA' "${num_hosts}" >&2
+        fi
         
         for host_entry in "${hosts[@]}"; do
             read -r hostname ssh_user <<< "$(parse_host "${host_entry}")"
@@ -235,32 +226,31 @@ draw_tui() {
                 IFS='|' read -r status message < "${status_file}"
             fi
             
-            # Calculate row for this host
-            local row=$((TUI_START_ROW + line_idx))
+            # Clear line and move to beginning
+            if command -v tput &>/dev/null; then
+                tput el 2>/dev/null || printf '\033[2K' >&2
+            else
+                printf '\033[2K' >&2
+            fi
+            printf '\r' >&2
             
-            # Build the line content
-            local line_content
+            # Build and print the line content
             case "${status}" in
                 running)
                     all_done=false
                     local spinner="${SPINNER_FRAMES[$spinner_idx]}"
-                    line_content="${COLOR_INFO}${spinner}${COLOR_RESET} ${hostname}: ${message}"
+                    printf '%b%s%b %s: %s\n' "${COLOR_INFO}" "${spinner}" "${COLOR_RESET}" "${hostname}" "${message}" >&2
                     ;;
                 success)
-                    line_content="${COLOR_SUCCESS}✔${COLOR_RESET} ${hostname}: ${message}"
+                    printf '%b✔%b %s: %s\n' "${COLOR_SUCCESS}" "${COLOR_RESET}" "${hostname}" "${message}" >&2
                     ;;
                 error)
-                    line_content="${COLOR_ERROR}✘${COLOR_RESET} ${hostname}: ${message}"
+                    printf '%b✘%b %s: %s\n' "${COLOR_ERROR}" "${COLOR_RESET}" "${hostname}" "${message}" >&2
                     ;;
                 warning)
-                    line_content="${COLOR_WARNING}⚠${COLOR_RESET} ${hostname}: ${message}"
+                    printf '%b⚠%b %s: %s\n' "${COLOR_WARNING}" "${COLOR_RESET}" "${hostname}" "${message}" >&2
                     ;;
             esac
-            
-            # Draw the line at specific row
-            draw_line "${row}" "${line_content}"
-            
-            ((line_idx++))
         done
         
         # Update spinner
@@ -270,11 +260,12 @@ draw_tui() {
         sleep 0.1
     done
     
-    # Move cursor to after our display area
-    printf '\033[%d;1H' "$((TUI_START_ROW + num_hosts))" >&2
-    
     # Show cursor again
-    printf '%b' "${CURSOR_SHOW}" >&2
+    if command -v tput &>/dev/null; then
+        tput cnorm 2>/dev/null || printf '%b' "${CURSOR_SHOW}" >&2
+    else
+        printf '%b' "${CURSOR_SHOW}" >&2
+    fi
 }
 
 #==============================================================================
