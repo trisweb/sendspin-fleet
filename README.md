@@ -5,12 +5,13 @@ A simple fleet management tool for maintaining and updating sendspin-cli install
 ## Features
 
 - **Parallel Execution**: All operations run simultaneously across all hosts for maximum speed
-- **Live Output**: See real-time progress from all hosts as operations complete
+- **Live TUI Display**: Beautiful terminal UI with per-host status lines that update in real-time
+- **Animated Progress**: Spinners show which hosts are actively working
 - **Status Monitoring**: Check service status, version, and configured name across all hosts
 - **System Updates**: Update system packages via `apt` on all hosts
 - **Sendspin Updates**: Update sendspin-cli package via `uv` on all hosts
 - **Batch Operations**: Update both system and sendspin packages in one command
-- **Colorful Output**: Beautiful terminal interface with hostname-prefixed colored messages
+- **Colorful Output**: Color-coded status indicators (green ✔, red ✘, yellow ⚠)
 - **Flexible Configuration**: Support for different SSH users per host
 
 ## Prerequisites
@@ -82,69 +83,81 @@ HOSTS_FILE=production-hosts.conf SENDSPIN_USER=audioplayer ./sendspin-fleet stat
 ### Available Commands
 
 #### `status`
-Check the status of all hosts in your fleet **in parallel**:
+Check the status of all hosts in your fleet **in parallel with a live TUI**:
 - SSH connectivity
 - Service status (running/stopped/failed)
 - Sendspin version
 - Configured device name from settings
 
-Output is displayed in real-time with hostname prefixes as each host responds.
-
 ```bash
 ./sendspin-fleet status
 ```
 
-Example output:
-```
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Fleet Status Report
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The TUI displays one line per host that updates in real-time:
 
+**While running:**
+```
 ℹ Running on 3 host(s) in parallel...
 
-[player1.local] ✔ SSH connected
-[player2.local] ✔ SSH connected
-[player1.local] ℹ ✔ Service: Running
-[player3.local] ✔ SSH connected
-[player1.local] ℹ Version: 0.2.1
-[player2.local] ℹ ✔ Service: Running
-[player1.local] ℹ Name: Kitchen Speaker
-[player2.local] ℹ Version: 0.2.1
-[player3.local] ℹ ✔ Service: Running
-[player2.local] ℹ Name: Living Room
-[player3.local] ℹ Version: 0.2.1
-[player3.local] ℹ Name: Bedroom
+⠋ player1.local: Checking service status...
+⠙ player2.local: Retrieving version info...
+⠹ player3.local: Connecting via SSH...
+```
+
+**When complete:**
+```
+ℹ Running on 3 host(s) in parallel...
+
+✔ player1.local: ✔ Kitchen Speaker | v0.2.1 | active
+✔ player2.local: ✔ Living Room | v0.2.1 | active
+✔ player3.local: ✔ Bedroom | v0.2.1 | active
 
 ✔ All operations completed successfully
 ```
 
 #### `update-system`
-Update system packages on all hosts using `apt` **in parallel**:
+Update system packages on all hosts using `apt` **in parallel with live TUI**:
 ```bash
 ./sendspin-fleet update-system
 ```
 
 Executes on each host: `sudo apt update && sudo apt upgrade -y`
 
-All hosts are updated simultaneously with live output showing progress from each.
+Watch the TUI as each host progresses through:
+- Connecting via SSH
+- Running apt update
+- Running apt upgrade (may take a while)
+- Completion
+
+Each host's line updates with its current step, with a spinner showing active operations.
 
 #### `update-sendspin`
-Update the sendspin-cli package on all hosts using `uv` **in parallel**:
+Update the sendspin-cli package on all hosts using `uv` **in parallel with live TUI**:
 ```bash
 ./sendspin-fleet update-sendspin
 ```
 
 Executes on each host: `sudo -u sendspin /home/sendspin/.local/bin/uv tool upgrade sendspin`
 
-Also restarts the sendspin service after updating each host. All operations run in parallel.
+Watch real-time progress for each host:
+- Connecting via SSH
+- Upgrading sendspin via uv
+- Restarting sendspin service
+- Completion with new version number
+
+All hosts update simultaneously with animated spinners showing which are actively working.
 
 #### `update-all`
-Update both system packages and sendspin-cli on all hosts **in parallel**:
+Update both system packages and sendspin-cli on all hosts **in parallel with live TUI**:
 ```bash
 ./sendspin-fleet update-all
 ```
 
-This runs `update-system` on all hosts in parallel, then runs `update-sendspin` on all hosts in parallel. Maximum efficiency!
+This runs two phases:
+1. System updates on all hosts in parallel (with TUI)
+2. Sendspin updates on all hosts in parallel (with TUI)
+
+Maximum efficiency with clear visual feedback throughout!
 
 #### `help`
 Display usage information:

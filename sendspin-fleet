@@ -32,6 +32,16 @@ readonly COLOR_SUCCESS="\033[92m"
 readonly COLOR_ERROR="\033[91m"
 readonly COLOR_INFO="\033[36m"
 readonly COLOR_WARNING="\033[33m"
+readonly COLOR_DIM="\033[2m"
+
+# ANSI cursor control
+readonly CURSOR_HIDE="\033[?25l"
+readonly CURSOR_SHOW="\033[?25h"
+readonly CURSOR_SAVE="\033[s"
+readonly CURSOR_RESTORE="\033[u"
+
+# Spinner frames
+readonly SPINNER_FRAMES=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
 
 # Print a header message
 print_header() {
@@ -65,13 +75,14 @@ print_warning() {
     echo -e "${COLOR_WARNING}⚠ $1${COLOR_RESET}" >&2
 }
 
-# Print with hostname prefix
-print_with_prefix() {
-    local hostname="$1"
-    local color="$2"
-    local message="$3"
-    echo -e "${color}[${hostname}]${COLOR_RESET} ${message}"
+# Cleanup function for TUI
+cleanup_tui() {
+    echo -e "${CURSOR_SHOW}" >&2
+    [[ -n "${STATUS_DIR:-}" ]] && rm -rf "${STATUS_DIR}"
 }
+
+# Trap to ensure cursor is restored on exit
+trap cleanup_tui EXIT INT TERM
 
 # Display usage information
 show_usage() {
@@ -157,6 +168,90 @@ ssh_exec() {
 }
 
 #==============================================================================
+# TUI Display Functions
+#==============================================================================
+
+# Update status for a single host (writes to status file)
+update_host_status() {
+    local hostname="$1"
+    local status="$2"
+    local message="$3"
+    
+    local status_file="${STATUS_DIR}/${hostname}.status"
+    echo "${status}|${message}" > "${status_file}"
+}
+
+# Draw the TUI display
+draw_tui() {
+    local -a hosts=("$@")
+    local num_hosts=${#hosts[@]}
+    
+    # Clear screen area and hide cursor
+    echo -e "${CURSOR_HIDE}" >&2
+    
+    # Draw initial lines for each host
+    for host_entry in "${hosts[@]}"; do
+        read -r hostname ssh_user <<< "$(parse_host "${host_entry}")"
+        echo -e "${COLOR_DIM}${hostname}: Initializing...${COLOR_RESET}" >&2
+    done
+    
+    # Monitor and update display
+    local spinner_idx=0
+    local all_done=false
+    
+    while [[ "${all_done}" == false ]]; do
+        all_done=true
+        local line_idx=0
+        
+        # Move cursor to start of our display area
+        echo -e "\033[${num_hosts}A" >&2
+        
+        for host_entry in "${hosts[@]}"; do
+            read -r hostname ssh_user <<< "$(parse_host "${host_entry}")"
+            local status_file="${STATUS_DIR}/${hostname}.status"
+            
+            # Read current status
+            local status="running"
+            local message="Connecting..."
+            if [[ -f "${status_file}" ]]; then
+                IFS='|' read -r status message < "${status_file}"
+            fi
+            
+            # Clear line and draw status
+            echo -ne "\033[2K" >&2
+            
+            case "${status}" in
+                running)
+                    all_done=false
+                    local spinner="${SPINNER_FRAMES[$spinner_idx]}"
+                    echo -e "${COLOR_INFO}${spinner}${COLOR_RESET} ${hostname}: ${message}" >&2
+                    ;;
+                success)
+                    echo -e "${COLOR_SUCCESS}✔${COLOR_RESET} ${hostname}: ${message}" >&2
+                    ;;
+                error)
+                    echo -e "${COLOR_ERROR}✘${COLOR_RESET} ${hostname}: ${message}" >&2
+                    ;;
+                warning)
+                    echo -e "${COLOR_WARNING}⚠${COLOR_RESET} ${hostname}: ${message}" >&2
+                    ;;
+            esac
+            
+            ((line_idx++))
+        done
+        
+        # Update spinner
+        spinner_idx=$(( (spinner_idx + 1) % ${#SPINNER_FRAMES[@]} ))
+        
+        # Small delay to avoid CPU spinning
+        sleep 0.1
+    done
+    
+    # Show cursor again
+    echo -e "${CURSOR_SHOW}" >&2
+}
+
+#==============================================================================
 # Parallel Execution Framework
 #==============================================================================
 
@@ -181,7 +276,7 @@ execute_for_host() {
     esac
 }
 
-# Run operation in parallel across all hosts
+# Run operation in parallel across all hosts with TUI
 run_parallel() {
     local operation="$1"
     local -a hosts
@@ -189,14 +284,21 @@ run_parallel() {
     
     mapfile -t hosts < <(read_hosts "${HOSTS_FILE}")
     
+    # Create temporary directory for status tracking
+    STATUS_DIR=$(mktemp -d)
+    export STATUS_DIR
+    
     print_info "Running on ${#hosts[@]} host(s) in parallel..."
-    echo
+    echo >&2
     
     # Start all operations in parallel
     for host_entry in "${hosts[@]}"; do
         execute_for_host "${host_entry}" "${operation}" &
         pids+=($!)
     done
+    
+    # Draw TUI and monitor progress
+    draw_tui "${hosts[@]}"
     
     # Wait for all background jobs to complete
     local failed=0
@@ -206,7 +308,11 @@ run_parallel() {
         fi
     done
     
-    echo
+    # Cleanup
+    rm -rf "${STATUS_DIR}"
+    unset STATUS_DIR
+    
+    echo >&2
     if [[ ${failed} -eq 0 ]]; then
         print_success "All operations completed successfully"
     else
@@ -223,45 +329,47 @@ check_status_single() {
     local hostname="$1"
     local ssh_user="$2"
     
+    update_host_status "${hostname}" "running" "Connecting via SSH..."
+    
     # Check SSH connectivity
     if ! ssh_exec "${hostname}" "${ssh_user}" "echo connected" &>/dev/null; then
-        print_with_prefix "${hostname}" "${COLOR_ERROR}" "✘ Unable to connect via SSH"
+        update_host_status "${hostname}" "error" "Unable to connect via SSH"
         return 1
     fi
     
-    print_with_prefix "${hostname}" "${COLOR_SUCCESS}" "✔ SSH connected"
+    update_host_status "${hostname}" "running" "Checking service status..."
     
     # Get service status
     local service_status
     service_status=$(ssh_exec "${hostname}" "${ssh_user}" \
         "systemctl is-active sendspin 2>/dev/null || echo 'not-found'")
     
-    local status_msg
-    case "${service_status}" in
-        active)
-            status_msg="${COLOR_SUCCESS}✔ Service: Running${COLOR_RESET}"
-            ;;
-        inactive|failed)
-            status_msg="${COLOR_ERROR}✘ Service: Failed/Stopped${COLOR_RESET}"
-            ;;
-        *)
-            status_msg="${COLOR_WARNING}⚠ Service: Unknown/Not Found${COLOR_RESET}"
-            ;;
-    esac
-    print_with_prefix "${hostname}" "${COLOR_INFO}" "${status_msg}"
+    update_host_status "${hostname}" "running" "Retrieving version info..."
     
     # Get sendspin version
     local version
     version=$(ssh_exec "${hostname}" "${ssh_user}" \
         "sudo -u ${SENDSPIN_USER} /home/${SENDSPIN_USER}/.local/bin/sendspin --version 2>/dev/null || echo 'N/A'")
-    print_with_prefix "${hostname}" "${COLOR_INFO}" "Version: ${version}"
     
     # Get configured name from settings
     local config_name
     config_name=$(ssh_exec "${hostname}" "${ssh_user}" \
         "sudo -u ${SENDSPIN_USER} cat /home/${SENDSPIN_USER}/.config/sendspin/settings-daemon.json 2>/dev/null | grep -oP '\"name\"\\s*:\\s*\"\\K[^\"]+' || echo 'N/A'")
-    print_with_prefix "${hostname}" "${COLOR_INFO}" "Name: ${config_name}"
     
+    # Build final status message
+    local service_icon="⚠"
+    local final_status="success"
+    case "${service_status}" in
+        active)
+            service_icon="✔"
+            ;;
+        inactive|failed)
+            service_icon="✘"
+            final_status="warning"
+            ;;
+    esac
+    
+    update_host_status "${hostname}" "${final_status}" "${service_icon} ${config_name} | v${version} | ${service_status}"
     return 0
 }
 
@@ -270,25 +378,30 @@ update_system_single() {
     local hostname="$1"
     local ssh_user="$2"
     
+    update_host_status "${hostname}" "running" "Connecting via SSH..."
+    
     # Check SSH connectivity
     if ! ssh_exec "${hostname}" "${ssh_user}" "echo connected" &>/dev/null; then
-        print_with_prefix "${hostname}" "${COLOR_ERROR}" "✘ Unable to connect via SSH"
+        update_host_status "${hostname}" "error" "Unable to connect via SSH"
         return 1
     fi
     
-    print_with_prefix "${hostname}" "${COLOR_INFO}" "Starting apt update && upgrade..."
+    update_host_status "${hostname}" "running" "Running apt update..."
     
     local update_output
+    if ! ssh_exec "${hostname}" "${ssh_user}" "sudo DEBIAN_FRONTEND=noninteractive apt update -qq" &>/dev/null; then
+        update_host_status "${hostname}" "error" "apt update failed"
+        return 1
+    fi
+    
+    update_host_status "${hostname}" "running" "Running apt upgrade (this may take a while)..."
+    
     if update_output=$(ssh_exec "${hostname}" "${ssh_user}" \
-        "sudo DEBIAN_FRONTEND=noninteractive apt update -qq && sudo DEBIAN_FRONTEND=noninteractive apt upgrade -y -qq" 2>&1); then
-        print_with_prefix "${hostname}" "${COLOR_SUCCESS}" "✔ System packages updated"
+        "sudo DEBIAN_FRONTEND=noninteractive apt upgrade -y -qq" 2>&1); then
+        update_host_status "${hostname}" "success" "System packages updated successfully"
         return 0
     else
-        print_with_prefix "${hostname}" "${COLOR_ERROR}" "✘ System update failed"
-        # Show error output with prefix
-        echo "${update_output}" | while IFS= read -r line; do
-            print_with_prefix "${hostname}" "${COLOR_ERROR}" "  ${line}"
-        done
+        update_host_status "${hostname}" "error" "apt upgrade failed"
         return 1
     fi
 }
@@ -298,38 +411,38 @@ update_sendspin_single() {
     local hostname="$1"
     local ssh_user="$2"
     
+    update_host_status "${hostname}" "running" "Connecting via SSH..."
+    
     # Check SSH connectivity
     if ! ssh_exec "${hostname}" "${ssh_user}" "echo connected" &>/dev/null; then
-        print_with_prefix "${hostname}" "${COLOR_ERROR}" "✘ Unable to connect via SSH"
+        update_host_status "${hostname}" "error" "Unable to connect via SSH"
         return 1
     fi
     
-    print_with_prefix "${hostname}" "${COLOR_INFO}" "Upgrading sendspin via uv..."
+    update_host_status "${hostname}" "running" "Upgrading sendspin via uv..."
     
     local update_output
     if update_output=$(ssh_exec "${hostname}" "${ssh_user}" \
         "sudo -u ${SENDSPIN_USER} /home/${SENDSPIN_USER}/.local/bin/uv tool upgrade sendspin" 2>&1); then
-        print_with_prefix "${hostname}" "${COLOR_SUCCESS}" "✔ Sendspin package upgraded"
         
-        # Show upgrade output with prefix
-        echo "${update_output}" | while IFS= read -r line; do
-            [[ -n "${line}" ]] && print_with_prefix "${hostname}" "${COLOR_INFO}" "  ${line}"
-        done
+        # Extract version if possible
+        local new_version=$(echo "${update_output}" | grep -oP 'sendspin.*\K\d+\.\d+\.\d+' | head -1)
+        if [[ -n "${new_version}" ]]; then
+            update_host_status "${hostname}" "running" "Upgraded to v${new_version}, restarting service..."
+        else
+            update_host_status "${hostname}" "running" "Package upgraded, restarting service..."
+        fi
     else
-        print_with_prefix "${hostname}" "${COLOR_ERROR}" "✘ Sendspin upgrade failed"
-        echo "${update_output}" | while IFS= read -r line; do
-            print_with_prefix "${hostname}" "${COLOR_ERROR}" "  ${line}"
-        done
+        update_host_status "${hostname}" "error" "Sendspin upgrade failed"
         return 1
     fi
     
     # Restart service
-    print_with_prefix "${hostname}" "${COLOR_INFO}" "Restarting sendspin service..."
     if ssh_exec "${hostname}" "${ssh_user}" "sudo systemctl restart sendspin" &>/dev/null; then
-        print_with_prefix "${hostname}" "${COLOR_SUCCESS}" "✔ Service restarted"
+        update_host_status "${hostname}" "success" "Upgraded and service restarted"
         return 0
     else
-        print_with_prefix "${hostname}" "${COLOR_WARNING}" "⚠ Service restart may have failed"
+        update_host_status "${hostname}" "warning" "Upgraded but service restart may have failed"
         return 1
     fi
 }
