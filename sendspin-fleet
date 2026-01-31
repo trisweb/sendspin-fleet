@@ -386,11 +386,11 @@ check_status_single() {
             ;;
     esac
     
-    update_host_status "${hostname}" "${final_status}" "${service_icon} ${config_name} | v${version} | ${service_status}"
+    update_host_status "${hostname}" "${final_status}" "${service_icon} ${config_name} | ${version} | ${service_status}"
     return 0
 }
 
-# Update system packages on a single host
+# Update system packages on a single host with progress tracking
 update_system_single() {
     local hostname="$1"
     local ssh_user="$2"
@@ -405,21 +405,74 @@ update_system_single() {
     
     update_host_status "${hostname}" "running" "Running apt update..."
     
-    local update_output
     if ! ssh_exec "${hostname}" "${ssh_user}" "sudo DEBIAN_FRONTEND=noninteractive apt update -qq" &>/dev/null; then
         update_host_status "${hostname}" "error" "apt update failed"
         return 1
     fi
     
-    update_host_status "${hostname}" "running" "Running apt upgrade (this may take a while)..."
+    # Count upgradable packages
+    update_host_status "${hostname}" "running" "Checking upgradable packages..."
+    local upgradable_count
+    upgradable_count=$(ssh_exec "${hostname}" "${ssh_user}" \
+        "apt list --upgradable 2>/dev/null | grep -c upgradable || echo 0")
+    upgradable_count=${upgradable_count//[^0-9]/}  # Strip non-digits
     
-    if update_output=$(ssh_exec "${hostname}" "${ssh_user}" \
-        "sudo DEBIAN_FRONTEND=noninteractive apt upgrade -y -qq" 2>&1); then
-        update_host_status "${hostname}" "success" "System packages updated successfully"
+    if [[ "${upgradable_count}" -eq 0 ]]; then
+        update_host_status "${hostname}" "success" "System is up to date (0 packages)"
+        return 0
+    fi
+    
+    update_host_status "${hostname}" "running" "Upgrading ${upgradable_count} packages..."
+    
+    # Run upgrade and track progress by counting installed packages
+    # Use a remote script that outputs progress
+    local upgrade_script='
+        count=0
+        total='"${upgradable_count}"'
+        sudo DEBIAN_FRONTEND=noninteractive apt upgrade -y 2>&1 | while read -r line; do
+            if [[ "$line" =~ ^(Setting up|Unpacking) ]]; then
+                ((count++))
+                echo "PROGRESS:$count/$total"
+            fi
+        done
+        echo "DONE"
+    '
+    
+    local current_pkg=0
+    local last_update=0
+    
+    # Stream the output and update progress
+    ssh -o ConnectTimeout=10 \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR \
+        "${ssh_user}@${hostname}" \
+        "bash -c '${upgrade_script}'" 2>&1 | while IFS= read -r line; do
+        if [[ "${line}" =~ ^PROGRESS:([0-9]+)/([0-9]+) ]]; then
+            current_pkg="${BASH_REMATCH[1]}"
+            total_pkg="${BASH_REMATCH[2]}"
+            # Only update every few packages or at end to reduce file writes
+            if [[ $((current_pkg - last_update)) -ge 1 ]] || [[ "${current_pkg}" == "${total_pkg}" ]]; then
+                update_host_status "${hostname}" "running" "Upgrading packages: ${current_pkg}/${total_pkg}"
+                last_update="${current_pkg}"
+            fi
+        elif [[ "${line}" == "DONE" ]]; then
+            break
+        fi
+    done
+    
+    # Verify upgrade completed
+    local remaining
+    remaining=$(ssh_exec "${hostname}" "${ssh_user}" \
+        "apt list --upgradable 2>/dev/null | grep -c upgradable || echo 0")
+    remaining=${remaining//[^0-9]/}
+    
+    if [[ "${remaining}" -eq 0 ]]; then
+        update_host_status "${hostname}" "success" "Upgraded ${upgradable_count} packages"
         return 0
     else
-        update_host_status "${hostname}" "error" "apt upgrade failed"
-        return 1
+        update_host_status "${hostname}" "warning" "Upgraded, but ${remaining} packages still pending"
+        return 0
     fi
 }
 
