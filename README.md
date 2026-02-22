@@ -6,9 +6,9 @@ A simple fleet management tool for maintaining and updating sendspin-cli install
 
 - **Parallel Execution**: All operations run simultaneously across all hosts for maximum speed
 - **Live TUI Display**: Beautiful terminal UI with per-host status lines that update in real-time
-- **Animated Progress**: Spinners show which hosts are actively working
+- **Animated Progress**: Spinners show which hosts are actively working, package counts during upgrades
 - **Status Monitoring**: Check service status, version, and configured name across all hosts
-- **System Updates**: Update system packages via `apt` on all hosts
+- **System Updates**: Update system packages via `apt` on all hosts with per-package progress
 - **Sendspin Updates**: Update sendspin-cli package via `uv` on all hosts
 - **Batch Operations**: Update both system and sendspin packages in one command
 - **Colorful Output**: Color-coded status indicators (green ✔, red ✘, yellow ⚠)
@@ -24,29 +24,36 @@ A simple fleet management tool for maintaining and updating sendspin-cli install
 
 ## Installation
 
-1. Clone or download this repository:
+The script is a single self-contained file — just copy it to any directory in your `$PATH`:
+
 ```bash
-git clone <repository-url> sendspin-fleet
-cd sendspin-fleet
+# Download and install
+curl -sL https://raw.githubusercontent.com/trisweb/sendspin-fleet/main/sendspin-fleet \
+    -o ~/.local/bin/sendspin-fleet
+chmod +x ~/.local/bin/sendspin-fleet
 ```
 
-2. Make the script executable:
+Or clone and symlink:
 ```bash
-chmod +x sendspin-fleet
-```
-
-3. Create your hosts configuration file:
-```bash
-cp hosts.conf.example hosts.conf
+git clone https://github.com/trisweb/sendspin-fleet
+ln -s "$(pwd)/sendspin-fleet/sendspin-fleet" ~/.local/bin/sendspin-fleet
 ```
 
 ## Configuration
 
-### Hosts Configuration
+### Hosts Configuration File
 
-Edit `hosts.conf` to define your fleet of hosts. Format: `hostname:ssh_user` (one per line).
+The script looks for hosts in `~/.config/sendspin-fleet-hosts.conf` by default. Create this file to get started:
 
-Example `hosts.conf`:
+```bash
+mkdir -p ~/.config
+cp hosts.conf.example ~/.config/sendspin-fleet-hosts.conf
+# Edit with your actual hosts
+$EDITOR ~/.config/sendspin-fleet-hosts.conf
+```
+
+Format: `hostname:ssh_user` (one per line):
+
 ```
 # Production audio players
 player1.local:root
@@ -58,7 +65,7 @@ dev-player.local:myuser
 audio-endpoint-01:sendspin
 ```
 
-**Important Notes:**
+**Notes:**
 - Lines starting with `#` are treated as comments
 - Empty lines are ignored
 - If no user is specified (no colon), defaults to `root`
@@ -66,34 +73,39 @@ audio-endpoint-01:sendspin
 
 ### Environment Variables
 
-- `HOSTS_FILE`: Path to hosts configuration file (default: `hosts.conf`)
-- `SENDSPIN_USER`: Service user name for sendspin (default: `sendspin`)
+Override defaults as needed:
 
-Example with custom configuration:
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HOSTS_FILE` | `~/.config/sendspin-fleet-hosts.conf` | Path to hosts configuration file |
+| `SENDSPIN_USER` | `sendspin` | Service user name on remote hosts |
+
 ```bash
-HOSTS_FILE=production-hosts.conf SENDSPIN_USER=audioplayer ./sendspin-fleet status
+# Use a different hosts file
+HOSTS_FILE=~/my-other-fleet.conf sendspin-fleet status
+
+# Use a different service user
+SENDSPIN_USER=audioplayer sendspin-fleet update-sendspin
 ```
 
 ## Usage
 
 ```bash
-./sendspin-fleet <command>
+sendspin-fleet <command>
 ```
 
-### Available Commands
+### Commands
 
 #### `status`
-Check the status of all hosts in your fleet **in parallel with a live TUI**:
+Check the live status of all hosts in parallel:
 - SSH connectivity
 - Service status (running/stopped/failed)
 - Sendspin version
 - Configured device name from settings
 
 ```bash
-./sendspin-fleet status
+sendspin-fleet status
 ```
-
-The TUI displays one line per host that updates in real-time:
 
 **While running:**
 ```
@@ -106,168 +118,96 @@ The TUI displays one line per host that updates in real-time:
 
 **When complete:**
 ```
-ℹ Running on 3 host(s) in parallel...
-
-✔ player1.local: ✔ Kitchen Speaker | v0.2.1 | active
-✔ player2.local: ✔ Living Room | v0.2.1 | active
-✔ player3.local: ✔ Bedroom | v0.2.1 | active
+✔ player1.local: ✔ Kitchen Speaker | 0.2.1 | active
+✔ player2.local: ✔ Living Room | 0.2.1 | active
+✔ player3.local: ✔ Bedroom | 0.2.1 | active
 
 ✔ All operations completed successfully
 ```
 
 #### `update-system`
-Update system packages on all hosts using `apt` **in parallel with live TUI**:
+Update system packages on all hosts in parallel with live per-package progress:
 ```bash
-./sendspin-fleet update-system
+sendspin-fleet update-system
 ```
 
-Executes on each host: `sudo apt update && sudo apt upgrade -y`
-
-Watch the TUI as each host progresses through:
-- Connecting via SSH
-- Running apt update
-- Running apt upgrade (may take a while)
-- Completion
-
-Each host's line updates with its current step, with a spinner showing active operations.
+Progress display during upgrade:
+```
+⠋ player1.local: Upgrading packages: 7/15
+⠙ player2.local: Upgrading packages: 3/8
+✔ player3.local: Upgraded 12 packages
+```
 
 #### `update-sendspin`
-Update the sendspin-cli package on all hosts using `uv` **in parallel with live TUI**:
+Update sendspin-cli via `uv` on all hosts in parallel:
 ```bash
-./sendspin-fleet update-sendspin
+sendspin-fleet update-sendspin
 ```
 
-Executes on each host: `sudo -u sendspin /home/sendspin/.local/bin/uv tool upgrade sendspin`
-
-Watch real-time progress for each host:
-- Connecting via SSH
-- Upgrading sendspin via uv
-- Restarting sendspin service
-- Completion with new version number
-
-All hosts update simultaneously with animated spinners showing which are actively working.
+Shows per-host progress through upgrade and service restart.
 
 #### `update-all`
-Update both system packages and sendspin-cli on all hosts **in parallel with live TUI**:
+Full update: system packages followed by sendspin, both in parallel:
 ```bash
-./sendspin-fleet update-all
+sendspin-fleet update-all
 ```
 
-This runs two phases:
-1. System updates on all hosts in parallel (with TUI)
-2. Sendspin updates on all hosts in parallel (with TUI)
-
-Maximum efficiency with clear visual feedback throughout!
-
 #### `help`
-Display usage information:
 ```bash
-./sendspin-fleet help
+sendspin-fleet help
 ```
 
 ## SSH Setup
 
-For passwordless SSH authentication, you need to set up public key authentication on all target hosts.
+For passwordless SSH authentication on each target host:
 
-### Generate SSH Key (if you don't have one)
 ```bash
+# Generate a key if needed
 ssh-keygen -t ed25519 -C "sendspin-fleet"
-```
 
-### Copy Public Key to Each Host
-```bash
+# Copy to each host
 ssh-copy-id user@hostname
-```
 
-Replace `user@hostname` with the actual SSH user and hostname from your `hosts.conf`.
-
-### Test SSH Connection
-```bash
-ssh user@hostname echo "Connection successful"
-```
-
-If this works without prompting for a password, you're all set!
-
-## Examples
-
-### Basic Status Check
-```bash
-./sendspin-fleet status
-```
-
-### Update Everything on All Hosts
-```bash
-./sendspin-fleet update-all
-```
-
-### Update Only System Packages
-```bash
-./sendspin-fleet update-system
-```
-
-### Update Only Sendspin
-```bash
-./sendspin-fleet update-sendspin
-```
-
-### Custom Configuration
-```bash
-# Use a different hosts file
-HOSTS_FILE=production-hosts.conf ./sendspin-fleet status
-
-# Use a different service user name
-SENDSPIN_USER=audioplayer ./sendspin-fleet update-sendspin
-
-# Combine both
-HOSTS_FILE=prod.conf SENDSPIN_USER=audioplayer ./sendspin-fleet update-all
+# Verify
+ssh user@hostname echo "OK"
 ```
 
 ## Troubleshooting
 
 ### "Hosts file not found"
-Make sure you've created a `hosts.conf` file in the same directory as the script. You can copy from the example:
+Create the config file:
 ```bash
-cp hosts.conf.example hosts.conf
+mkdir -p ~/.config
+cp hosts.conf.example ~/.config/sendspin-fleet-hosts.conf
 ```
+Or set `HOSTS_FILE` to an existing file.
 
 ### "Unable to connect via SSH"
-1. Verify the hostname is correct and reachable: `ping hostname`
-2. Check SSH public key authentication is set up: `ssh user@hostname`
-3. Ensure the SSH user in `hosts.conf` matches the user you've set up keys for
-
-### "tui-toolkit.sh not found"
-Download the bash-tui-toolkit:
-```bash
-curl -sL https://raw.githubusercontent.com/timo-reymann/bash-tui-toolkit/main/tui-toolkit.sh -o tui-toolkit.sh
-```
+1. Check reachability: `ping hostname`
+2. Test SSH directly: `ssh user@hostname`
+3. Ensure the user in your config matches the one with SSH key access
 
 ### Service Status Shows "Unknown/Not Found"
-The service name may not match the `SENDSPIN_USER`. Check the actual service name:
+Verify the service name on the remote host:
 ```bash
 ssh user@hostname systemctl list-units --type=service | grep sendspin
 ```
 
-Then adjust the `SENDSPIN_USER` environment variable accordingly.
-
 ## Architecture
 
-The script follows a simple architecture:
+1. **Configuration Loading**: Reads hosts from `~/.config/sendspin-fleet-hosts.conf`
+2. **Parallel Fork**: Spawns one background process per host
+3. **Status Tracking**: Workers write status updates to temp files
+4. **TUI Display Loop**: Main process redraws host lines at 10Hz using ANSI cursor control
+5. **Progress Streaming**: For apt upgrades, output is streamed and parsed for package counts
+6. **Process Management**: Waits for all jobs, reports overall success/failure
 
-1. **Configuration Loading**: Reads hosts from `hosts.conf`
-2. **SSH Execution**: Uses SSH with public key auth to run commands remotely
-3. **Command Dispatch**: Routes to appropriate handler based on subcommand
-4. **Error Handling**: Gracefully handles connection failures and reports errors
-5. **TUI Output**: Uses bash-tui-toolkit for colored, formatted output
+### Performance
 
-## Contributing
-
-Contributions are welcome! Please feel free to submit issues or pull requests.
-
-## License
-
-This project is provided as-is for managing sendspin-cli deployments.
+With N hosts each taking T seconds:
+- **Sequential**: N × T seconds
+- **Parallel (this tool)**: ~T seconds
 
 ## Credits
 
-- Uses [bash-tui-toolkit](https://github.com/timo-reymann/bash-tui-toolkit) for terminal UI
-- Designed for [sendspin](https://github.com/trisweb/sendspin) audio player system
+Designed for [sendspin](https://github.com/trisweb/sendspin) audio player system.

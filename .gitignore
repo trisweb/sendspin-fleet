@@ -1,4 +1,4 @@
-# Actual hosts configuration (keep example only)
+# Local hosts config (lives at ~/.config/sendspin-fleet-hosts.conf, not here)
 hosts.conf
 
 # Backup files

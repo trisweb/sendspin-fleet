@@ -1,8 +1,17 @@
 # sendspin-fleet hosts configuration
-# Format: hostname:ssh_user
-# Lines starting with # are ignored
-# One host per line
-
+# ====================================
+# Copy this file to: ~/.config/sendspin-fleet-hosts.conf
+# Then edit with your actual hosts.
+#
+# Format: hostname:ssh_user (one per line)
+#   - Lines starting with # are ignored
+#   - Empty lines are ignored
+#   - If no user is specified (no colon), defaults to root
+#
+# The script looks for config in this order:
+#   1. $HOSTS_FILE environment variable (if set)
+#   2. ~/.config/sendspin-fleet-hosts.conf (default)
+#
 # Examples:
 # player1.local:root
 # player2.local:admin

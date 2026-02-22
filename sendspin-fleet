@@ -17,8 +17,9 @@ set -o pipefail  # Exit on pipe failure
 # Default service user name (can be overridden via environment variable)
 SENDSPIN_USER="${SENDSPIN_USER:-sendspin}"
 
-# Default hosts configuration file
-HOSTS_FILE="${HOSTS_FILE:-hosts.conf}"
+# Default hosts configuration file - XDG-compliant location
+# Override with HOSTS_FILE environment variable if needed
+HOSTS_FILE="${HOSTS_FILE:-${HOME}/.config/sendspin-fleet-hosts.conf}"
 
 #==============================================================================
 # Output Helper Functions
