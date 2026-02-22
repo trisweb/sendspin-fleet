@@ -76,14 +76,51 @@ print_warning() {
     echo -e "${COLOR_WARNING}⚠ $1${COLOR_RESET}" >&2
 }
 
-# Cleanup function for TUI
-cleanup_tui() {
-    echo -e "${CURSOR_SHOW}" >&2
-    [[ -n "${STATUS_DIR:-}" ]] && rm -rf "${STATUS_DIR}"
+# Global array of worker PIDs so we can kill them all on interrupt
+declare -a WORKER_PIDS=()
+INTERRUPTED=false
+
+# Handle Ctrl-C: kill all workers, mark running hosts cancelled, let TUI do
+# one final redraw then exit via the normal draw-loop completion path.
+handle_interrupt() {
+    INTERRUPTED=true
+
+    # Kill every background worker
+    if [[ ${#WORKER_PIDS[@]} -gt 0 ]]; then
+        kill "${WORKER_PIDS[@]}" 2>/dev/null || true
+    fi
+
+    # Mark any still-running hosts as cancelled so the TUI reflects it
+    if [[ -d "${STATUS_DIR:-}" ]]; then
+        for status_file in "${STATUS_DIR}"/*.status; do
+            [[ -f "${status_file}" ]] || continue
+            local current_status
+            IFS='|' read -r current_status _ < "${status_file}"
+            if [[ "${current_status}" == "running" ]]; then
+                echo "error|Cancelled" > "${status_file}"
+            fi
+        done
+    fi
+    # Do NOT call exit here — the draw loop will see all hosts done,
+    # do one final redraw, and return naturally.
 }
 
-# Trap to ensure cursor is restored on exit
-trap cleanup_tui EXIT INT TERM
+# Cleanup function: restore cursor and remove temp dir (runs on EXIT)
+cleanup_tui() {
+    if command -v tput &>/dev/null; then
+        tput cnorm 2>/dev/null || printf '%b' "${CURSOR_SHOW}" >&2
+    else
+        printf '%b' "${CURSOR_SHOW}" >&2
+    fi
+    [[ -n "${STATUS_DIR:-}" ]] && rm -rf "${STATUS_DIR}"
+    if [[ "${INTERRUPTED}" == true ]]; then
+        echo >&2
+        print_warning "Interrupted — all operations cancelled"
+    fi
+}
+
+trap cleanup_tui EXIT
+trap handle_interrupt INT TERM
 
 # Display usage information
 show_usage() {
@@ -309,29 +346,35 @@ run_parallel() {
     print_info "Running on ${#hosts[@]} host(s) in parallel..."
     echo >&2
     
-    # Start all operations in parallel
+    # Start all operations in parallel; track PIDs for interrupt handling
+    WORKER_PIDS=()
     for host_entry in "${hosts[@]}"; do
         execute_for_host "${host_entry}" "${operation}" &
-        pids+=($!)
+        local pid=$!
+        pids+=("${pid}")
+        WORKER_PIDS+=("${pid}")
     done
     
     # Draw TUI and monitor progress
     draw_tui "${hosts[@]}"
     
-    # Wait for all background jobs to complete
+    # Wait for all background jobs to complete (they may already be dead if interrupted)
     local failed=0
     for pid in "${pids[@]}"; do
-        if ! wait "${pid}"; then
+        if ! wait "${pid}" 2>/dev/null; then
             ((failed++)) || true
         fi
     done
-    
-    # Cleanup
+    WORKER_PIDS=()
+
+    # Cleanup temp dir
     rm -rf "${STATUS_DIR}"
     unset STATUS_DIR
-    
+
     echo >&2
-    if [[ ${failed} -eq 0 ]]; then
+    if [[ "${INTERRUPTED}" == true ]]; then
+        return 1
+    elif [[ ${failed} -eq 0 ]]; then
         print_success "All operations completed successfully"
     else
         print_warning "${failed} operation(s) had issues"
@@ -490,21 +533,33 @@ update_sendspin_single() {
         return 1
     fi
     
-    update_host_status "${hostname}" "running" "Upgrading sendspin via uv..."
-    
+    update_host_status "${hostname}" "running" "Upgrading sendspin via uv (timeout: 120s)..."
+
+    # Run uv upgrade with a 120-second local timeout; exit code 124 = timed out
     local update_output
-    if update_output=$(ssh_exec "${hostname}" "${ssh_user}" \
-        "sudo -u ${SENDSPIN_USER} /home/${SENDSPIN_USER}/.local/bin/uv tool upgrade sendspin" 2>&1); then
-        
-        # Extract version if possible
-        local new_version=$(echo "${update_output}" | grep -oP 'sendspin.*\K\d+\.\d+\.\d+' | head -1)
+    if update_output=$(timeout 120 ssh \
+            -o ConnectTimeout=10 \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
+            "${ssh_user}@${hostname}" \
+            "sudo -u ${SENDSPIN_USER} /home/${SENDSPIN_USER}/.local/bin/uv tool upgrade sendspin" 2>&1); then
+
+        # Extract new version from uv output if present
+        local new_version
+        new_version=$(echo "${update_output}" | grep -oP 'sendspin.*\K\d+\.\d+\.\d+' | head -1)
         if [[ -n "${new_version}" ]]; then
-            update_host_status "${hostname}" "running" "Upgraded to v${new_version}, restarting service..."
+            update_host_status "${hostname}" "running" "Upgraded to ${new_version}, restarting service..."
         else
             update_host_status "${hostname}" "running" "Package upgraded, restarting service..."
         fi
     else
-        update_host_status "${hostname}" "error" "Sendspin upgrade failed"
+        local exit_code=$?
+        if [[ ${exit_code} -eq 124 ]]; then
+            update_host_status "${hostname}" "error" "Timed out after 120s waiting for uv upgrade"
+        else
+            update_host_status "${hostname}" "error" "Sendspin upgrade failed (exit ${exit_code})"
+        fi
         return 1
     fi
     
