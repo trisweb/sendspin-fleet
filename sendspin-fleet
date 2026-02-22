@@ -143,9 +143,6 @@ show_usage() {
     echo "  HOSTS_FILE      Path to hosts configuration file (default: hosts.conf)"
     echo "  SENDSPIN_USER   Service user name (default: sendspin)"
     echo
-    print_subheader "Performance:"
-    echo "  All operations run in parallel across hosts for maximum speed!"
-    echo
 }
 
 # Read and parse the hosts configuration file
